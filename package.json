@@ -1,0 +1,30 @@
+{
+  "name": "disrupt-procure-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DISRUPT PROCURE AI — AI procurement and store intelligence platform. Photo-first product identification, live market research, a closed-loop stock-to-purchase workflow, and a quotation auditor, all with mandatory human approval on spend.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node tests/test-procurex.js"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "papaparse": "^5.4.1",
+    "xlsx": "^0.18.5",
+    "mammoth": "^1.8.0",
+    "@google/genai": "latest"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "tailwindcss": "^3.4.10",
+    "postcss": "^8.4.41",
+    "autoprefixer": "^10.4.20"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
