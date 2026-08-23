@@ -563,13 +563,23 @@ async function callClaude({ system, prompt, useWebSearch = false, maxTokens = 15
 }
 
 function extractJSON(text) {
-  const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const cleaned = (text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
   const start = cleaned.indexOf("[") === -1 ? cleaned.indexOf("{") : Math.min(...[cleaned.indexOf("["), cleaned.indexOf("{")].filter((i) => i !== -1));
   const lastArr = cleaned.lastIndexOf("]");
   const lastObj = cleaned.lastIndexOf("}");
   const end = Math.max(lastArr, lastObj);
-  if (start === -1 || end === -1) throw new Error("No JSON found in AI response");
-  return JSON.parse(cleaned.slice(start, end + 1));
+  if (start === -1 || end === -1) {
+    // Show what the AI actually said instead of a blank "no JSON" message —
+    // this is almost always either a quota/rate-limit message or a safety
+    // refusal, and the person needs to see which.
+    const snippet = cleaned.slice(0, 200) || "(empty response)";
+    throw new Error(`AI response wasn't valid JSON. It said: "${snippet}${cleaned.length > 200 ? "…" : ""}"`);
+  }
+  try {
+    return JSON.parse(cleaned.slice(start, end + 1));
+  } catch (e) {
+    throw new Error(`AI response looked like JSON but failed to parse (${e.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
+  }
 }
 
 // ---------- Demo seed data (clearly labeled) ----------
@@ -2453,8 +2463,18 @@ function ProcurementAuditor({ state, setState, pushAudit }) {
       const unitPrice = line.unitPrice ?? (line.total && line.qty ? line.total / line.qty : null);
       const auditResult = unitPrice != null ? auditQuotationLine({ quotedUnitPrice: unitPrice, qty: line.qty || 1, historyStats, marketFindings: marketEvidence?.findings || [] })
         : { verdict: "NO PRICE PROVIDED", notes: "This line has no unit price to audit." };
+      // If the market-research call itself failed (e.g. AI quota/rate limit),
+      // say so explicitly instead of silently showing "insufficient market
+      // evidence" as if nothing went wrong — those are different situations
+      // and only one of them means "there's genuinely no data out there."
+      if (err) auditResult.notes = `Market research call failed: ${err}`;
 
       audited.push({ ...line, matchedProductId: matched?.id || null, matchedProductName: matched?.name || null, historyStats, marketEvidence, marketError: err, audit: auditResult, unitPriceUsed: unitPrice });
+
+      // small pause between lines — free-tier AI APIs rate-limit aggressively,
+      // and auditing several lines back-to-back with zero delay is the
+      // single most common way to trip that limit mid-run
+      if (i < lines.length - 1) await new Promise((r) => setTimeout(r, 1200));
     }
     setAuditProgress(null);
     setAuditing(false);
@@ -2571,7 +2591,9 @@ function ProcurementAuditor({ state, setState, pushAudit }) {
                     <td className="p-3 text-right px-font-mono text-[var(--muted)]">{r.historyStats ? fmtPKR(r.historyStats.avg) : "no history"}</td>
                     <td className="p-3 text-right px-font-mono text-[var(--muted)]">{r.audit.marketMin ? `${fmtPKR(r.audit.marketMin)}–${fmtPKR(r.audit.marketMax)}` : "—"}</td>
                     <td className="p-3 text-right px-font-mono">{r.audit.overpayTotalMax ? `${fmtPKR(r.audit.overpayTotalMin)}–${fmtPKR(r.audit.overpayTotalMax)}` : "—"}</td>
-                    <td className="p-3"><Badge tone={r.audit.verdict === "ABOVE MARKET" ? "critical" : r.audit.verdict === "WITHIN MARKET" ? "healthy" : r.audit.verdict.startsWith("BELOW") ? "info" : "default"}>{r.audit.verdict}</Badge></td>
+                    <td className="p-3"><Badge tone={r.marketError ? "critical" : r.audit.verdict === "ABOVE MARKET" ? "critical" : r.audit.verdict === "WITHIN MARKET" ? "healthy" : r.audit.verdict.startsWith("BELOW") ? "info" : "default"}>{r.marketError ? "RESEARCH FAILED" : r.audit.verdict}</Badge>
+                      {r.marketError && <div className="text-[10px] text-[var(--danger)] mt-1 max-w-xs">{r.marketError}</div>}
+                    </td>
                   </tr>
                 ))}
               </tbody>
