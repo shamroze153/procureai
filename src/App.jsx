@@ -1345,7 +1345,7 @@ RULES:
             className="flex-1 bg-[var(--panel2)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm" />
           <Btn variant="primary" onClick={research} disabled={loading}>{loading ? "Researching…" : "Research market price"}</Btn>
         </div>
-        {err && <div className="mt-3 text-sm text-[var(--danger)]">⚠ {err} — check that GEMINI_API_KEY is set correctly in your deployment's environment variables.</div>}
+        {err && <div className="mt-3 text-sm text-[var(--danger)]">⚠ {err}</div>}
       </Card>
 
       {result && (

@@ -23,7 +23,17 @@ const { GoogleGenAI } = require("@google/genai");
 
 // Override with a GEMINI_MODEL env var if Google deprecates this one too —
 // no code change needed, just update the env var and redeploy.
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+//
+// Model choice, verified against Google's current docs (not guessed):
+// gemini-2.5-flash-lite — cheapest current model ($0.10/$0.40 per 1M
+// tokens), genuinely multimodal (text/image/audio/video/PDF — covers
+// every input type this app sends), supports Grounding with Google
+// Search (required for Market Research / Procurement Auditor), and has
+// the most generous free-tier rate limits of any current model. Note:
+// one Google pricing page flags an Oct 16, 2026 retirement date for this
+// model — if it's gone by the time you read this, set GEMINI_MODEL to
+// whatever Google's current cheapest Flash-tier multimodal model is.
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 
 function toGeminiParts(content) {
   if (typeof content === "string") return [{ text: content }];
@@ -95,6 +105,14 @@ module.exports = async function handler(req, res) {
     // other real cause) is immediately visible instead of a bare status code.
     const status = err?.status || err?.response?.status || 502;
     const detail = err?.message || err?.response?.statusText || String(err);
+
+    if (status === 429 || /RESOURCE_EXHAUSTED/i.test(detail)) {
+      res.status(429).json({
+        error: `Gemini free-tier quota reached (model: ${MODEL}). This is a rate limit from Google, not a bug — wait a minute and try again, or enable billing on your Google AI Studio project for higher limits (still very cheap; see ai.google.dev/gemini-api/docs/rate-limits).`,
+      });
+      return;
+    }
+
     res.status(typeof status === "number" ? status : 502).json({
       error: `Gemini API error (model: ${MODEL}): ${detail}`,
     });
