@@ -583,11 +583,50 @@ function extractJSON(text) {
     const snippet = cleaned.slice(0, 200) || "(empty response)";
     throw new Error(`AI response wasn't valid JSON. It said: "${snippet}${cleaned.length > 200 ? "…" : ""}"`);
   }
+  const slice = cleaned.slice(start, end + 1);
   try {
-    return JSON.parse(cleaned.slice(start, end + 1));
-  } catch (e) {
-    throw new Error(`AI response looked like JSON but failed to parse (${e.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
+    return JSON.parse(slice);
+  } catch (firstErr) {
+    // Retry once with control characters inside strings repaired — handles
+    // the common "AI put a raw newline/tab inside a text field instead of
+    // escaping it" case (a genuinely different bug from truncation) without
+    // a second network call.
+    try {
+      return JSON.parse(sanitizeJSONControlChars(slice));
+    } catch (e) {
+      throw new Error(`AI response looked like JSON but failed to parse (${firstErr.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
+    }
   }
+}
+
+// Escapes raw control characters (literal newlines, tabs, etc.) found
+// INSIDE a JSON string literal, without touching whitespace between
+// structural tokens (which is normal in pretty-printed JSON).
+function sanitizeJSONControlChars(s) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const code = s.charCodeAt(i);
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue; }
+      if (ch === "\\") { out += ch; escaped = true; continue; }
+      if (ch === '"') { inString = false; out += ch; continue; }
+      if (code < 0x20) {
+        if (ch === "\n") out += "\\n";
+        else if (ch === "\r") out += "\\r";
+        else if (ch === "\t") out += "\\t";
+        else out += "\\u" + code.toString(16).padStart(4, "0");
+        continue;
+      }
+      out += ch;
+    } else {
+      if (ch === '"') { inString = true; out += ch; continue; }
+      out += ch;
+    }
+  }
+  return out;
 }
 
 // ---------- Gemini native structured-output schemas ----------

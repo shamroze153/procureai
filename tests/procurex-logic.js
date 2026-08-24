@@ -622,6 +622,42 @@ function auditQuotationLine({ quotedUnitPrice, qty, historyStats, marketFindings
 // Never silently swallows a parse failure: always surfaces what the AI
 // actually said so the real cause (truncation, refusal, rate-limit text
 // that leaked into the response) is visible instead of a blank error.
+// Escapes raw control characters (literal newlines, tabs, etc.) that
+// appear INSIDE a JSON string literal, without touching whitespace that
+// sits between structural tokens (which is normal and fine in
+// pretty-printed JSON). LLMs occasionally emit a real line break inside a
+// text field (e.g. "notes") instead of escaping it as \n — that's invalid
+// per the JSON spec ("Bad control character in string literal") even
+// though the JSON is otherwise complete and well-formed. This is a
+// distinct failure mode from truncation and needs a different fix: repair
+// the string in place rather than just reporting the error.
+function sanitizeJSONControlChars(s) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    const code = s.charCodeAt(i);
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue; }
+      if (ch === "\\") { out += ch; escaped = true; continue; }
+      if (ch === '"') { inString = false; out += ch; continue; }
+      if (code < 0x20) {
+        if (ch === "\n") out += "\\n";
+        else if (ch === "\r") out += "\\r";
+        else if (ch === "\t") out += "\\t";
+        else out += "\\u" + code.toString(16).padStart(4, "0");
+        continue;
+      }
+      out += ch;
+    } else {
+      if (ch === '"') { inString = true; out += ch; continue; }
+      out += ch;
+    }
+  }
+  return out;
+}
+
 function extractJSON(text) {
   const cleaned = (text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
   const start = cleaned.indexOf("[") === -1 ? cleaned.indexOf("{") : Math.min(...[cleaned.indexOf("["), cleaned.indexOf("{")].filter((i) => i !== -1));
@@ -632,10 +668,18 @@ function extractJSON(text) {
     const snippet = cleaned.slice(0, 200) || "(empty response)";
     throw new Error(`AI response wasn't valid JSON. It said: "${snippet}${cleaned.length > 200 ? "…" : ""}"`);
   }
+  const slice = cleaned.slice(start, end + 1);
   try {
-    return JSON.parse(cleaned.slice(start, end + 1));
-  } catch (e) {
-    throw new Error(`AI response looked like JSON but failed to parse (${e.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
+    return JSON.parse(slice);
+  } catch (firstErr) {
+    // retry once with control characters inside strings repaired — handles
+    // the common "raw newline in a text field" case without a second
+    // network call
+    try {
+      return JSON.parse(sanitizeJSONControlChars(slice));
+    } catch (e) {
+      throw new Error(`AI response looked like JSON but failed to parse (${firstErr.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
+    }
   }
 }
 

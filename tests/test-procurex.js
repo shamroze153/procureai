@@ -513,6 +513,28 @@ test("extractJSON: valid JSON with a genuinely long findings array (many vendors
   const result = L.extractJSON(payload);
   assert.strictEqual(result.findings.length, 15);
 });
+test("extractJSON: repairs a literal (unescaped) newline inside a JSON string value — a distinct real bug from truncation ('Bad control character in string literal')", () => {
+  // this is NOT valid JSON on its own — it has a real newline byte inside
+  // the "notes" string instead of an escaped \n, which is exactly what a
+  // Gemini market-research response produced in practice
+  const withRawNewline = '{"overallConfidence": 75, "insufficientEvidence": false, "notes": "Prices are fluctuating and depend on the specific model (inverter vs.\nnon-inverter, floor standing vs. split).", "findings": [{"vendor": "ABC", "price": 5000}]}';
+  const result = L.extractJSON(withRawNewline);
+  assert.strictEqual(result.overallConfidence, 75);
+  assert.ok(result.notes.includes("inverter"));
+  assert.strictEqual(result.findings[0].vendor, "ABC");
+});
+test("extractJSON: repairs a raw tab character inside a string value too, not just newlines", () => {
+  const withRawTab = '{"notes": "line one\tline two", "ok": true}';
+  const result = L.extractJSON(withRawTab);
+  assert.strictEqual(result.ok, true);
+  assert.ok(result.notes.includes("line one"));
+});
+test("extractJSON: newlines BETWEEN JSON tokens (normal pretty-printing, not inside a string) are left alone and still parse fine", () => {
+  const prettyPrinted = '{\n  "a": 1,\n  "b": "two"\n}';
+  const result = L.extractJSON(prettyPrinted);
+  assert.strictEqual(result.a, 1);
+  assert.strictEqual(result.b, "two");
+});
 
 
 console.log("\n=== ProcureX AI — automated test results ===\n");
