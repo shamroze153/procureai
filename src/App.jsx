@@ -531,7 +531,7 @@ async function extractErrorMessage(res, fallbackLabel) {
   return msg;
 }
 
-async function callClaude({ system, prompt, useWebSearch = false, maxTokens = 1500 }) {
+async function callClaude({ system, prompt, useWebSearch = false, maxTokens = 1500, responseSchema = null }) {
   const body = {
     model: "claude-sonnet-4-6",
     max_tokens: maxTokens,
@@ -540,6 +540,14 @@ async function callClaude({ system, prompt, useWebSearch = false, maxTokens = 15
   };
   if (useWebSearch) {
     body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+  }
+  // Native structured output — the backend applies this via responseSchema
+  // + responseMimeType on Gemini's side (constrained decoding), which
+  // guarantees schema-conforming JSON instead of relying on the model to
+  // follow a "respond with only JSON" instruction in the prompt. Not used
+  // together with useWebSearch — see api/gemini.js for why.
+  if (responseSchema && !useWebSearch) {
+    body.responseSchema = responseSchema;
   }
   const res = await fetch("/api/gemini", {
     method: "POST",
@@ -581,6 +589,102 @@ function extractJSON(text) {
     throw new Error(`AI response looked like JSON but failed to parse (${e.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
   }
 }
+
+// ---------- Gemini native structured-output schemas ----------
+// Google's "Type" enum values (uppercase strings) per the current Gemini
+// API structured-output docs. One schema per JSON shape this app actually
+// asks the AI to return — used everywhere except the one grounded call
+// (Market Research), which api/gemini.js deliberately excludes from
+// schema mode to avoid an unconfirmed schema+grounding combo on
+// gemini-2.5-flash-lite. See that file for the full explanation.
+const SCHEMA_VISION_IDENTIFY = {
+  type: "OBJECT",
+  properties: {
+    identified: { type: "BOOLEAN" },
+    confidence: { type: "INTEGER" },
+    catalogMatch: { type: "STRING", nullable: true },
+    brand: { type: "STRING" },
+    model: { type: "STRING" },
+    specification: { type: "STRING" },
+    notes: { type: "STRING" },
+    clarificationNeeded: { type: "STRING" },
+  },
+  required: ["identified"],
+};
+
+const SCHEMA_PHOTO_CANDIDATES = {
+  type: "OBJECT",
+  properties: {
+    identified: { type: "BOOLEAN" },
+    clarificationNeeded: { type: "STRING" },
+    candidates: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          label: { type: "STRING" },
+          brand: { type: "STRING" },
+          model: { type: "STRING" },
+          specification: { type: "STRING" },
+          partNumber: { type: "STRING" },
+          unit: { type: "STRING" },
+          confidence: { type: "INTEGER" },
+          catalogMatch: { type: "STRING", nullable: true },
+        },
+        required: ["label", "confidence"],
+      },
+    },
+  },
+  required: ["identified", "candidates"],
+};
+
+const SCHEMA_QUOTATION_EXTRACTION = {
+  type: "OBJECT",
+  properties: {
+    vendor: { type: "STRING", nullable: true },
+    date: { type: "STRING", nullable: true },
+    lines: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          product: { type: "STRING" },
+          brand: { type: "STRING" },
+          model: { type: "STRING" },
+          specification: { type: "STRING" },
+          qty: { type: "NUMBER", nullable: true },
+          vendor: { type: "STRING" },
+          unitPrice: { type: "NUMBER", nullable: true },
+          tax: { type: "NUMBER", nullable: true },
+          total: { type: "NUMBER", nullable: true },
+          date: { type: "STRING", nullable: true },
+        },
+        required: ["product"],
+      },
+    },
+  },
+  required: ["lines"],
+};
+
+const SCHEMA_RECHECK_VERDICT = {
+  type: "OBJECT",
+  properties: {
+    verdict: { type: "STRING", enum: ["confirm recommendation", "flag concern"] },
+    confidence: { type: "INTEGER" },
+    notes: { type: "STRING" },
+  },
+  required: ["verdict", "confidence", "notes"],
+};
+
+const SCHEMA_VOICE_REQUEST = {
+  type: "OBJECT",
+  properties: {
+    catalogMatch: { type: "STRING", nullable: true },
+    description: { type: "STRING" },
+    quantity: { type: "NUMBER", nullable: true },
+  },
+  required: ["description"],
+};
 
 // ---------- Demo seed data (clearly labeled) ----------
 const CATEGORIES = ["Electrical", "HVAC", "Plumbing", "Hardware", "Safety", "Tools"];
@@ -1566,9 +1670,10 @@ function Approvals({ state, setState, pushAudit }) {
     const hist = product ? purchaseHistoryStats(state.transactions.filter((t) => t.productId === product.id)) : null;
     try {
       const { text } = await callClaude({
-        system: `You are re-checking a pending procurement recommendation before a manager approves it. Base your re-check ONLY on the data given — never invent prices, vendors, or history that aren't provided. Respond with ONLY JSON: {"verdict": "confirm recommendation" | "flag concern", "confidence": 0-100, "notes": "2-3 sentences explaining the verdict, referencing only the given data"}`,
+        system: `You are re-checking a pending procurement recommendation before a manager approves it. Base your re-check ONLY on the data given — never invent prices, vendors, or history that aren't provided.`,
         prompt: `Product: ${rfq.product}\nQuantity requested: ${rfq.qty}\nReason for request: ${rfq.reason || "none given"}\nBest quotation on file: ${bestQuote ? `${bestQuote.vendor} at ${fmtPKR(bestQuote.unitPrice)}` : "none logged"}\nHistorical purchase stats: ${hist ? JSON.stringify(hist) : "no purchase history on file"}`,
         maxTokens: 400,
+        responseSchema: SCHEMA_RECHECK_VERDICT,
       });
       const result = extractJSON(text);
       pushAudit("AI Re-check", `Re-check on "${rfq.product}": ${result.verdict} (confidence ${result.confidence}%). ${result.notes}`);
@@ -1872,11 +1977,12 @@ async function callClaudeVision({ base64, mediaType, catalogNames }) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "claude-sonnet-4-6", max_tokens: 700,
-      system: `You identify procurement items from a photo for a Pakistani facility-management store. You are given the store's current product catalog names for reference — prefer matching to one of these if the photo clearly matches, but you may also identify a brand/model/spec not in the catalog. NEVER invent a part number, brand, or spec you cannot actually see — if the image is unclear or you're not confident, say so and ask for a clearer photo (e.g. of the nameplate). Respond with ONLY JSON: {"identified": true|false, "confidence": 0-100, "catalogMatch": "exact catalog name or null", "brand": "", "model": "", "specification": "", "notes": "", "clarificationNeeded": "what photo would help, or empty string"}. Catalog: ${JSON.stringify(catalogNames).slice(0, 3000)}`,
+      system: `You identify procurement items from a photo for a Pakistani facility-management store. You are given the store's current product catalog names for reference — prefer matching to one of these if the photo clearly matches, but you may also identify a brand/model/spec not in the catalog. NEVER invent a part number, brand, or spec you cannot actually see — if the image is unclear or you're not confident, say so and ask for a clearer photo (e.g. of the nameplate). Catalog: ${JSON.stringify(catalogNames).slice(0, 3000)}`,
       messages: [{ role: "user", content: [
         { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
         { type: "text", text: "Identify this item." },
       ]}],
+      responseSchema: SCHEMA_VISION_IDENTIFY,
     }),
   });
   if (!res.ok) throw new Error(await extractErrorMessage(res, "Vision request failed"));
@@ -1900,32 +2006,46 @@ RULES:
 - Return UP TO 3 ranked candidate identifications with a real confidence score (0-100) each, most likely first. If you can only support one candidate, return just one.
 - If the photo is too unclear/blurry/distant to identify ANYTHING with reasonable confidence, set "identified": false and explain what photo would help (e.g. a closer shot of the nameplate) — do not force a guess.
 - "catalogMatch" should be the EXACT catalog name only if you're confident this photo shows that exact catalog item; otherwise null.
-Respond with ONLY JSON: {"identified": true|false, "clarificationNeeded": "", "candidates": [{"label": "Brand Model Specification", "brand": "", "model": "", "specification": "", "partNumber": "", "unit": "pcs", "confidence": 0-100, "catalogMatch": "exact catalog name or null"}]}
 Catalog: ${JSON.stringify(catalogNames).slice(0, 3000)}`,
       messages: [{ role: "user", content: [
         { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
         { type: "text", text: "Identify this product for procurement. Give up to 3 ranked candidates." },
       ]}],
+      responseSchema: SCHEMA_PHOTO_CANDIDATES,
     }),
   });
   if (!res.ok) throw new Error(await extractErrorMessage(res, "Vision request failed"));
   const data = await res.json();
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  return extractJSON(text);
+  const parsed = extractJSON(text);
+  // defensive: never let a missing/malformed candidates array reach the UI as undefined
+  if (!Array.isArray(parsed.candidates)) parsed.candidates = [];
+  return parsed;
 }
 
 // Full vendor/price intelligence for a confirmed product — the richer
 // schema the image-first flow needs (availability, delivery, warranty,
 // date checked), on top of the same "never fabricate" rules as the rest
 // of the app's market research.
+//
+// NOTE: this call uses web search grounding, so it deliberately does NOT
+// request native structured output (see api/gemini.js for why) — it's
+// hardened instead with a larger token budget (this response includes
+// grounding-derived findings + notes, which is what previously got cut
+// off mid-JSON around ~8800 characters at the old 1800-token ceiling)
+// and the improved extractJSON, which now shows the real cause if
+// parsing still fails instead of a blank error.
 async function researchProductSources(productLabel) {
   const { text } = await callClaude({
     useWebSearch: true,
-    system: `You are a procurement market-research agent for a company buying materials in Pakistan. Use web search to find REAL, currently available vendor pricing for the exact product given. Never invent a vendor, price, URL, availability claim, delivery time, or warranty term. If evidence is weak or absent, say so explicitly rather than guessing. Respond with ONLY JSON: {"overallConfidence": 0-100, "insufficientEvidence": true|false, "notes": "string", "recommendedPrice": number|null, "findings": [{"vendor": "string", "price": number|null, "currency": "PKR", "availability": "string", "delivery": "string", "warranty": "string", "sourceTitle": "string", "sourceUrl": "string", "dateChecked": "YYYY-MM-DD", "confidence": 0-100}]}`,
+    system: `You are a procurement market-research agent for a company buying materials in Pakistan. Use web search to find REAL, currently available vendor pricing for the exact product given. Never invent a vendor, price, URL, availability claim, delivery time, or warranty term. If evidence is weak or absent, say so explicitly rather than guessing. Respond with ONLY JSON, no other text: {"overallConfidence": 0-100, "insufficientEvidence": true|false, "notes": "string", "recommendedPrice": number|null, "findings": [{"vendor": "string", "price": number|null, "currency": "PKR", "availability": "string", "delivery": "string", "warranty": "string", "sourceTitle": "string", "sourceUrl": "string", "dateChecked": "YYYY-MM-DD", "confidence": 0-100}]}. Keep "notes" to 2-3 sentences and cap "findings" at the 5 best sources — do not let the response run long enough to risk truncation.`,
     prompt: `Research current Pakistani vendor pricing and availability for: "${productLabel}". Return the JSON only.`,
-    maxTokens: 1800,
+    maxTokens: 3500,
   });
-  return extractJSON(text);
+  const parsed = extractJSON(text);
+  // defensive: never let a missing/malformed findings array reach benchmarkPrice or the UI as undefined
+  if (!Array.isArray(parsed.findings)) parsed.findings = [];
+  return parsed;
 }
 
 function useSpeechRecognition() {
@@ -1976,9 +2096,10 @@ function TechnicianMode({ state, setState, pushAudit }) {
     setVoiceParsing(true);
     try {
       const { text } = await callClaude({
-        system: `Convert a spoken material request (English, Urdu, or Roman Urdu/mixed) into a structured procurement search. You are given the store's actual catalog — only set "catalogMatch" if you are confident it refers to that exact catalog item; otherwise leave it null and just extract the freeform description. Never invent a catalog item that isn't in the list. Respond with ONLY JSON: {"catalogMatch": "exact catalog name or null", "description": "plain-English description of what they want", "quantity": number|null}. Catalog: ${JSON.stringify(state.products.map((p) => p.name)).slice(0, 3000)}`,
+        system: `Convert a spoken material request (English, Urdu, or Roman Urdu/mixed) into a structured procurement search. You are given the store's actual catalog — only set "catalogMatch" if you are confident it refers to that exact catalog item; otherwise leave it null and just extract the freeform description. Never invent a catalog item that isn't in the list. Catalog: ${JSON.stringify(state.products.map((p) => p.name)).slice(0, 3000)}`,
         prompt: speech.transcript,
         maxTokens: 400,
+        responseSchema: SCHEMA_VOICE_REQUEST,
       });
       setVoiceResult(extractJSON(text));
     } catch (e) {
@@ -2354,7 +2475,7 @@ function Dashboard({ state, setTab }) {
 // ============================================================
 async function extractQuotationLines(file) {
   const name = file.name.toLowerCase();
-  const EXTRACT_SYSTEM = `You extract line items from a vendor quotation for a procurement audit. Extract EXACTLY what is present — never invent a product, price, quantity, or vendor that isn't actually shown. If a field isn't present for a line, use null (numbers) or "" (text). Respond with ONLY JSON: {"vendor": "overall vendor name if shown, else null", "date": "YYYY-MM-DD or null", "lines": [{"product": "", "brand": "", "model": "", "specification": "", "qty": number|null, "vendor": "", "unitPrice": number|null, "tax": number|null, "total": number|null, "date": "YYYY-MM-DD or null"}]}`;
+  const EXTRACT_SYSTEM = `You extract line items from a vendor quotation for a procurement audit. Extract EXACTLY what is present — never invent a product, price, quantity, or vendor that isn't actually shown. If a field isn't present for a line, use null (numbers) or "" (text).`;
 
   if (name.endsWith(".csv") || name.endsWith(".xlsx") || name.endsWith(".xls")) {
     let rows, headers;
@@ -2373,8 +2494,11 @@ async function extractQuotationLines(file) {
       system: EXTRACT_SYSTEM,
       prompt: `Extract quotation line items from this spreadsheet data (headers: ${headers.join(", ")}):\n${JSON.stringify(rows).slice(0, 6000)}`,
       maxTokens: 3000,
+      responseSchema: SCHEMA_QUOTATION_EXTRACTION,
     });
-    return extractJSON(text);
+    const parsed = extractJSON(text);
+    if (!Array.isArray(parsed.lines)) parsed.lines = [];
+    return parsed;
   }
 
   if (name.endsWith(".pdf")) {
@@ -2382,20 +2506,25 @@ async function extractQuotationLines(file) {
     const res = await fetch("/api/gemini", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3000, system: EXTRACT_SYSTEM,
-        messages: [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } }, { type: "text", text: "Extract the quotation line items from this PDF." }] }] }),
+        messages: [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } }, { type: "text", text: "Extract the quotation line items from this PDF." }] }],
+        responseSchema: SCHEMA_QUOTATION_EXTRACTION }),
     });
     if (!res.ok) throw new Error(await extractErrorMessage(res, "PDF extraction request failed"));
     const data = await res.json();
     const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-    return extractJSON(text);
+    const parsed = extractJSON(text);
+    if (!Array.isArray(parsed.lines)) parsed.lines = [];
+    return parsed;
   }
 
   if (name.endsWith(".docx")) {
     const buf = await file.arrayBuffer();
     const { value: docText } = await mammoth.extractRawText({ arrayBuffer: buf });
     if (!docText.trim()) throw new Error("Could not extract any text from this Word document.");
-    const { text } = await callClaude({ system: EXTRACT_SYSTEM, prompt: `Extract quotation line items from this document text:\n${docText.slice(0, 8000)}`, maxTokens: 3000 });
-    return extractJSON(text);
+    const { text } = await callClaude({ system: EXTRACT_SYSTEM, prompt: `Extract quotation line items from this document text:\n${docText.slice(0, 8000)}`, maxTokens: 3000, responseSchema: SCHEMA_QUOTATION_EXTRACTION });
+    const parsed = extractJSON(text);
+    if (!Array.isArray(parsed.lines)) parsed.lines = [];
+    return parsed;
   }
 
   if (file.type.startsWith("image/")) {
@@ -2403,12 +2532,15 @@ async function extractQuotationLines(file) {
     const res = await fetch("/api/gemini", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 3000, system: EXTRACT_SYSTEM,
-        messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: file.type, data: base64 } }, { type: "text", text: "Extract the quotation line items from this image/screenshot." }] }] }),
+        messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: file.type, data: base64 } }, { type: "text", text: "Extract the quotation line items from this image/screenshot." }] }],
+        responseSchema: SCHEMA_QUOTATION_EXTRACTION }),
     });
     if (!res.ok) throw new Error(await extractErrorMessage(res, "Image extraction request failed"));
     const data = await res.json();
     const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-    return extractJSON(text);
+    const parsed = extractJSON(text);
+    if (!Array.isArray(parsed.lines)) parsed.lines = [];
+    return parsed;
   }
 
   throw new Error("Unsupported file type. Use .xlsx, .csv, .pdf, .docx, or an image.");

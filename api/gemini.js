@@ -68,7 +68,7 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const { system, messages = [], max_tokens, tools } = req.body || {};
+    const { system, messages = [], max_tokens, tools, responseSchema } = req.body || {};
     const userMessage = messages.find((m) => m.role === "user") || messages[0];
     const parts = toGeminiParts(userMessage?.content);
     const useWebSearch = Array.isArray(tools) && tools.length > 0;
@@ -76,6 +76,23 @@ module.exports = async function handler(req, res) {
     const config = { maxOutputTokens: max_tokens || 1500 };
     if (system) config.systemInstruction = system;
     if (useWebSearch) config.tools = [{ googleSearch: {} }];
+
+    // Native structured output (responseSchema + responseMimeType) forces
+    // Gemini to emit schema-conforming JSON via constrained decoding — far
+    // more reliable than asking nicely in the prompt and hoping. BUT: as of
+    // Google's current docs, combining structured output with built-in
+    // tools (Google Search grounding) is only confirmed for the Gemini 3.x
+    // family, not gemini-2.5-flash-lite. Rather than risk breaking
+    // grounding (a hard requirement for Market Research), schema is only
+    // applied when web search is NOT in use for this request. The grounded
+    // call instead relies on prompt-based JSON + a larger token budget
+    // (the caller is responsible for that) + the frontend's hardened
+    // extractJSON, which now surfaces the real cause on failure instead of
+    // a blank error.
+    if (responseSchema && !useWebSearch) {
+      config.responseMimeType = "application/json";
+      config.responseSchema = responseSchema;
+    }
 
     const response = await ai.models.generateContent({
       model: MODEL,

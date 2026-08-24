@@ -616,11 +616,34 @@ function auditQuotationLine({ quotedUnitPrice, qty, historyStats, marketFindings
   };
 }
 
+// ---------- robust JSON extraction from AI text (fallback path) ----------
+// Used when a call didn't (or couldn't) use native structured output —
+// e.g. as a safety net, or for providers/paths that don't support it.
+// Never silently swallows a parse failure: always surfaces what the AI
+// actually said so the real cause (truncation, refusal, rate-limit text
+// that leaked into the response) is visible instead of a blank error.
+function extractJSON(text) {
+  const cleaned = (text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  const start = cleaned.indexOf("[") === -1 ? cleaned.indexOf("{") : Math.min(...[cleaned.indexOf("["), cleaned.indexOf("{")].filter((i) => i !== -1));
+  const lastArr = cleaned.lastIndexOf("]");
+  const lastObj = cleaned.lastIndexOf("}");
+  const end = Math.max(lastArr, lastObj);
+  if (start === -1 || end === -1) {
+    const snippet = cleaned.slice(0, 200) || "(empty response)";
+    throw new Error(`AI response wasn't valid JSON. It said: "${snippet}${cleaned.length > 200 ? "…" : ""}"`);
+  }
+  try {
+    return JSON.parse(cleaned.slice(start, end + 1));
+  } catch (e) {
+    throw new Error(`AI response looked like JSON but failed to parse (${e.message}). Raw: "${cleaned.slice(0, 200)}${cleaned.length > 200 ? "…" : ""}"`);
+  }
+}
+
 module.exports = {
   normalizeToken, tokenSet, jaccard, specTokens, setsEqual, toNumber,
   SCHEMA_SYNONYMS, mapColumn, findMappingCollisions,
   computeStockHealth, reorderQty, vendorScore, isDuplicateCandidate,
   buildImportPlan, effectiveUnitPrice, rankQuotations, purchaseHistoryStats,
   parseRating, looksLikePlaceholderVendor, detectTableBlocks, runDataQualityAudit, benchmarkPrice,
-  computeCurrentStock, validateIssueQuantity, computeProcurementStage, auditQuotationLine,
+  computeCurrentStock, validateIssueQuantity, computeProcurementStage, auditQuotationLine, extractJSON,
 };

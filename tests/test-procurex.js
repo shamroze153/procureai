@@ -477,6 +477,43 @@ test("auditQuotationLine: fair range never exceeds the highest real market price
   assert.ok(r.fairMin <= 4850);
 });
 
+/* ============================================================
+   14. extractJSON — regression coverage for malformed/truncated
+   AI responses (the root cause of the "AI response looked like
+   JSON but failed to parse" bug seen on real long market-research
+   responses that got cut off mid-array).
+   ============================================================ */
+test("extractJSON: parses clean, well-formed JSON normally", () => {
+  const result = L.extractJSON('{"overallConfidence": 85, "findings": [{"vendor": "X", "price": 100}]}');
+  assert.strictEqual(result.overallConfidence, 85);
+  assert.strictEqual(result.findings[0].vendor, "X");
+});
+test("extractJSON: strips markdown code fences before parsing", () => {
+  const result = L.extractJSON('```json\n{"ok": true}\n```');
+  assert.strictEqual(result.ok, true);
+});
+test("extractJSON: a response with no JSON at all throws with the actual text visible, not a blank message", () => {
+  assert.throws(() => L.extractJSON("I'm sorry, I cannot help with that request."), /I'm sorry, I cannot help/);
+});
+test("extractJSON: an empty response throws a clear '(empty response)' message rather than crashing uninformatively", () => {
+  assert.throws(() => L.extractJSON(""), /empty response/);
+});
+test("extractJSON: a long response truncated mid-array (the real bug that was observed — cut off around a findings array) throws with the parse error AND a visible raw snippet, not a silent failure", () => {
+  // simulates a real long market-research response that got cut off before
+  // its closing brackets — e.g. hitting a token limit mid-generation
+  const longNotes = "Prices vary significantly based on the vendor and specific model. ".repeat(120); // pushes well past 200 chars, like the real ~8856-char response
+  const truncated = `{"overallConfidence": 85, "insufficientEvidence": false, "notes": "${longNotes}", "findings": [{"vendor": "ABC Traders", "price": 4650, "sourceUrl": "https://example.com/a"}, {"vendor": "XYZ Elec`; // cut off mid-object, no closing braces at all
+  assert.throws(() => L.extractJSON(truncated), (err) => {
+    return err.message.includes("failed to parse") || err.message.includes("wasn't valid JSON");
+  });
+});
+test("extractJSON: valid JSON with a genuinely long findings array (many vendors) still parses correctly — long-but-complete is not the same bug as truncated", () => {
+  const findings = Array.from({ length: 15 }, (_, i) => ({ vendor: `Vendor ${i}`, price: 1000 + i, sourceUrl: `https://example.com/${i}`, dateChecked: "2026-08-23" }));
+  const payload = JSON.stringify({ overallConfidence: 70, insufficientEvidence: false, notes: "long but complete", findings });
+  const result = L.extractJSON(payload);
+  assert.strictEqual(result.findings.length, 15);
+});
+
 
 console.log("\n=== ProcureX AI — automated test results ===\n");
 results.forEach(([status, name, err]) => {
