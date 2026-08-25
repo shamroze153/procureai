@@ -51,17 +51,44 @@ function toOpenAIContent(content) {
   });
 }
 
+// Groq strict json_schema mode requires additionalProperties:false on
+// EVERY object node (not just the root) and every property key present
+// in that object's "required" array. This is the fix for a real reported
+// error: "invalid JSON schema for response_format: /properties/lines/
+// items: `additionalProperties:false` must be set on every object" — a
+// nested array-of-objects schema (our real quotation-extraction shape)
+// didn't have it set on the nested item objects.
+function ensureStrictObjectSchema(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(ensureStrictObjectSchema);
+  const clone = { ...schema };
+  const isObjectType = clone.type === "object" || (Array.isArray(clone.type) && clone.type.includes("object"));
+  if (isObjectType) {
+    if (clone.properties) {
+      const newProps = {};
+      for (const [k, v] of Object.entries(clone.properties)) newProps[k] = ensureStrictObjectSchema(v);
+      clone.properties = newProps;
+      clone.required = Object.keys(newProps);
+    }
+    if (clone.additionalProperties === undefined) clone.additionalProperties = false;
+  }
+  if (clone.items) clone.items = ensureStrictObjectSchema(clone.items);
+  return clone;
+}
+
 function buildJsonSchemaResponseFormat(schema, name) {
-  return { type: "json_schema", json_schema: { name: name || "response", strict: true, schema } };
+  return { type: "json_schema", json_schema: { name: name || "response", strict: true, schema: ensureStrictObjectSchema(schema) } };
 }
 
 // Confirmed model routing — see file header for the evidence behind each choice.
-// groq/compound had a documented, reported bug independent of request
-// size/content (other developers hit "Request Entity Too Large" on small,
-// ordinary requests) — using groq/compound-mini instead, Groq's documented
-// lighter alternative with the same web-search capability.
+// Web search: switched from groq/compound(-mini) to openai/gpt-oss-20b's
+// Browser Search tool with tool_choice:"required" — compound's automatic
+// tool routing is not guaranteed to actually invoke search (confirmed by
+// a real test: it returned "insufficient evidence" while admitting in its
+// own text it never searched). Forcing the tool with tool_choice:"required"
+// is the documented, reliable mechanism instead.
 function chooseGroqModel({ hasImage, useWebSearch, hasSchema }) {
-  if (useWebSearch) return { model: "groq/compound-mini", responseFormatMode: "none" };
+  if (useWebSearch) return { model: "openai/gpt-oss-20b", responseFormatMode: "none" };
   if (hasImage) return { model: "qwen/qwen3.6-27b", responseFormatMode: hasSchema ? "json_object" : "none" };
   return { model: "openai/gpt-oss-20b", responseFormatMode: hasSchema ? "json_schema" : "none" };
 }
@@ -96,6 +123,16 @@ module.exports = async function handler(req, res) {
     const body = { model, messages: chatMessages, max_tokens: max_tokens || 1500, stream: false };
     if (responseFormatMode === "json_schema") body.response_format = buildJsonSchemaResponseFormat(responseSchema, responseSchemaName);
     else if (responseFormatMode === "json_object") body.response_format = { type: "json_object" };
+    // Browser Search: confirmed only on openai/gpt-oss-20b/120b, and only
+    // guaranteed to actually run when tool_choice is "required" — Groq's
+    // own docs note it's otherwise auto-invoked "when needed," which a
+    // real test showed is not reliable for a query that genuinely needs
+    // current pricing. Not combined with response_format (unconfirmed
+    // whether Groq supports structured output + forced tool use together).
+    if (useWebSearch) {
+      body.tools = [{ type: "browser_search" }];
+      body.tool_choice = "required";
+    }
 
     const upstream = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
       method: "POST",
