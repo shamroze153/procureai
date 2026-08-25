@@ -56,8 +56,12 @@ function buildJsonSchemaResponseFormat(schema, name) {
 }
 
 // Confirmed model routing — see file header for the evidence behind each choice.
+// groq/compound had a documented, reported bug independent of request
+// size/content (other developers hit "Request Entity Too Large" on small,
+// ordinary requests) — using groq/compound-mini instead, Groq's documented
+// lighter alternative with the same web-search capability.
 function chooseGroqModel({ hasImage, useWebSearch, hasSchema }) {
-  if (useWebSearch) return { model: "groq/compound", responseFormatMode: "none" };
+  if (useWebSearch) return { model: "groq/compound-mini", responseFormatMode: "none" };
   if (hasImage) return { model: "qwen/qwen3.6-27b", responseFormatMode: hasSchema ? "json_object" : "none" };
   return { model: "openai/gpt-oss-20b", responseFormatMode: hasSchema ? "json_schema" : "none" };
 }
