@@ -683,6 +683,181 @@ function extractJSON(text) {
   }
 }
 
+// ---------- Procurement Auditor: document classification ----------
+// Before any table gets treated as a "quotation," it must actually look
+// like one. A product+quantity list with no vendor/price is a demand
+// list, not a quotation — auditing it would fabricate a comparison that
+// doesn't exist. This scores a table's headers (and, if there's no real
+// header row, falls back to inspecting the actual cell values) against
+// what each real document type looks like, and returns a classification
+// + confidence + the reasoning, never a guess dressed up as certainty.
+const QUOTATION_FIELD_SYNONYMS = {
+  product: ["item", "product", "name", "product name", "material", "description", "item description"],
+  qty: ["qty", "quantity", "required qty", "recommended qty", "order qty"],
+  unitPrice: ["unit price", "rate", "price", "unit cost"],
+  referencePrice: ["current price", "market price", "daraz price", "reference price", "list price"],
+  vendor: ["vendor", "supplier", "vendor name", "company", "seller"],
+  tax: ["tax", "gst", "vat"],
+  total: ["total", "amount", "total amount", "grand total"],
+  quoteRef: ["quotation no", "quote no", "quote number", "quotation number", "invoice no", "invoice number", "po number", "reference"],
+  date: ["date", "quotation date", "quote date", "invoice date"],
+  assetRegister: ["tag", "room", "location", "campus", "floor", "status", "health", "assignedtech", "assigned tech", "capacity"],
+};
+
+function headerHas(normHeaders, synonyms) {
+  return normHeaders.some((h) => synonyms.some((s) => { const sn = normalizeToken(s); return h === sn || h.includes(sn); }));
+}
+
+// value-based fallback for sheets with no real header row (e.g. a title
+// caption in row 1 followed directly by data) — inspects actual cell
+// values instead of header text
+function inferSignalsFromValues(rows) {
+  if (!rows || !rows.length) return { hasQty: false, hasDate: false, hasUnitPrice: false };
+  const cols = Object.keys(rows[0] || {});
+  let hasQty = false, hasDate = false, hasUnitPrice = false;
+  cols.forEach((col) => {
+    const vals = rows.map((r) => r[col]).filter((v) => v !== null && v !== undefined && v !== "");
+    if (!vals.length) return;
+    const numericVals = vals.filter((v) => typeof v === "number" || (!isNaN(Number(v)) && String(v).trim() !== ""));
+    const dateVals = vals.filter((v) => v instanceof Date || (typeof v === "string" && /^\d{4}-\d{2}-\d{2}/.test(v)));
+    if (dateVals.length >= vals.length * 0.6) { hasDate = true; return; }
+    if (numericVals.length >= vals.length * 0.6) {
+      const nums = numericVals.map(Number);
+      const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
+      // small whole numbers (<100, mostly integers) read as quantities;
+      // larger or fractional-looking values read as money — a rough but
+      // explainable heuristic, never presented as a real price
+      if (avg < 100 && nums.every((n) => Number.isInteger(n))) hasQty = true;
+      else if (avg >= 20) hasUnitPrice = true;
+    }
+  });
+  return { hasQty, hasDate, hasUnitPrice };
+}
+
+function classifySheetTable(headers, rows) {
+  const normHeaders = (headers || []).map((h) => normalizeToken(h)).filter(Boolean);
+  let hasProduct = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.product);
+  let hasQty = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.qty);
+  let hasUnitPrice = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.unitPrice);
+  const hasReferencePrice = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.referencePrice);
+  const hasVendor = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.vendor);
+  const hasTax = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.tax);
+  const hasTotal = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.total);
+  const hasQuoteRef = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.quoteRef);
+  let hasDate = headerHas(normHeaders, QUOTATION_FIELD_SYNONYMS.date);
+  const assetFieldCount = QUOTATION_FIELD_SYNONYMS.assetRegister.filter((s) => normHeaders.some((h) => h === normalizeToken(s) || h.includes(normalizeToken(s)))).length;
+
+  const usedValueFallback = normHeaders.filter((h) => h && !/^empty(\s?\d+)?$|^column\s?\d+$|^unnamed/.test(h)).length < 2;
+  if (usedValueFallback && rows && rows.length) {
+    const inferred = inferSignalsFromValues(rows);
+    hasQty = inferred.hasQty;
+    hasDate = inferred.hasDate;
+    hasUnitPrice = hasUnitPrice || inferred.hasUnitPrice;
+    hasProduct = Object.keys(rows[0] || {}).length > 0; // assume first text-bearing column is the product
+  }
+
+  const signals = { hasProduct, hasQty, hasUnitPrice, hasReferencePrice, hasVendor, hasTax, hasTotal, hasQuoteRef, hasDate, usedValueFallback };
+
+  if (assetFieldCount >= 3) {
+    return { classification: "Store/Inventory", confidence: Math.min(95, 60 + assetFieldCount * 8), signals, reason: `Matches ${assetFieldCount} asset-register fields (location/status/health/etc.) — this is an inventory/asset list, not a quotation or demand.` };
+  }
+
+  if (hasVendor && hasUnitPrice) {
+    let confidence = 60;
+    if (hasTotal) confidence += 10;
+    if (hasTax) confidence += 8;
+    if (hasQuoteRef) confidence += 12;
+    if (hasDate) confidence += 5;
+    const label = normHeaders.some((h) => h.includes("invoice")) ? "Invoice" : normHeaders.some((h) => h.includes("po") || h.includes("purchase order")) ? "Purchase Order" : "Vendor Quotation";
+    return { classification: label, confidence: Math.min(97, confidence), signals, reason: `Found vendor identity plus real pricing (unit price${hasTotal ? ", total" : ""}${hasTax ? ", tax" : ""}${hasQuoteRef ? ", reference/quote number" : ""}) — looks like a genuine ${label.toLowerCase()}.` };
+  }
+
+  if (hasReferencePrice && !hasQty) {
+    return { classification: "Price List", confidence: 80, signals, reason: "Contains reference/market prices per item with no quantity requested and no vendor — reads as a price-reference catalog, not an order." };
+  }
+
+  if (hasUnitPrice && !hasVendor) {
+    return { classification: "Internal Demand/Request", confidence: hasQty ? 70 : 55, signals, reason: `Has unit price${hasTotal ? "/total" : ""}${hasTax ? "/tax" : ""} but no vendor is identified anywhere — this looks like an internal cost estimate, not a vendor's quotation. There's no way to know who quoted these prices.` };
+  }
+
+  if (hasQty && !hasUnitPrice && !hasReferencePrice && !hasVendor) {
+    return { classification: "Internal Demand/Request", confidence: usedValueFallback ? 78 : (hasProduct ? 92 : 75), signals, reason: usedValueFallback ? "No labeled header row, but the data itself looks like product + quantity (+ possibly a date) with no pricing or vendor columns — an internal request, not a quotation." : "Only product and quantity found — no vendor, price, or tax information anywhere. This is an internal request, not a quotation." };
+  }
+
+  return { classification: "Unknown", confidence: 25, signals, reason: "Could not confidently classify this table against any known document type." };
+}
+
+// Applies the same rule (no vendor + no price = not a quotation) to
+// lines an AI already extracted from a PDF/image/docx — those formats
+// don't have inspectable headers, so this checks the extracted result
+// itself instead of spending a second AI call classifying first.
+function classifyExtractedLines(lines) {
+  if (!lines || !lines.length) return { classification: "Unknown", confidence: 0, reason: "No lines were extracted." };
+  const withVendor = lines.filter((l) => l.vendor && String(l.vendor).trim()).length;
+  const withPrice = lines.filter((l) => l.unitPrice !== null && l.unitPrice !== undefined).length;
+  const ratio = (n) => n / lines.length;
+  if (ratio(withVendor) >= 0.5 && ratio(withPrice) >= 0.5) {
+    return { classification: "Vendor Quotation", confidence: Math.round(70 + 20 * Math.min(ratio(withVendor), ratio(withPrice))), reason: `${withVendor}/${lines.length} lines have a vendor and ${withPrice}/${lines.length} have a unit price.` };
+  }
+  if (ratio(withPrice) >= 0.5 && ratio(withVendor) < 0.5) {
+    return { classification: "Internal Demand/Request", confidence: 65, reason: `${withPrice}/${lines.length} lines have a price but only ${withVendor}/${lines.length} have a vendor identified — pricing without a confirmed vendor isn't a quotation.` };
+  }
+  return { classification: "Internal Demand/Request", confidence: 85, reason: `Only ${withVendor}/${lines.length} lines have a vendor and ${withPrice}/${lines.length} have a price — this reads as a request list, not a quotation.` };
+}
+
+// ---------- xAI Grok provider adapter helpers (pure, testable) ----------
+// The frontend sends a provider-neutral request shape (system, messages
+// with text/image/document content blocks, responseSchema). These
+// functions translate that into xAI's OpenAI-compatible request format.
+// Mirrored (identical logic) into api/xai.js, which is what actually
+// runs server-side — duplicated here only so it's unit-testable without
+// spinning up a serverless function.
+
+// Converts our internal content-block array (or a plain string) into
+// OpenAI/xAI-compatible message content. Images become data-URI
+// image_url blocks (the documented xAI/OpenAI pattern). Document (PDF)
+// blocks are passed through as a labeled placeholder text block, NOT as
+// a native document attachment — xAI's public docs do not confirm PDF
+// input support the way Gemini's did, so we don't pretend it works;
+// callers relying on PDF quotation extraction should treat this as
+// unconfirmed until tested against a real key.
+function toOpenAIContent(content) {
+  if (typeof content === "string") return content;
+  return (content || []).map((block) => {
+    if (block.type === "text") return { type: "text", text: block.text };
+    if (block.type === "image") return { type: "image_url", image_url: { url: `data:${block.source.media_type};base64,${block.source.data}`, detail: "high" } };
+    if (block.type === "document") return { type: "text", text: "[A document/PDF was attached here. PDF input is not confirmed-supported by the xAI API — this placeholder is a visible signal that extraction from this file may not have actually reached the model. Verify against a real request before trusting results from PDF uploads.]" };
+    return { type: "text", text: "" };
+  });
+}
+
+// Wraps one of our provider-neutral JSON schemas (plain JSON Schema:
+// lowercase "object"/"string"/"array"/etc.) into the OpenAI/xAI
+// response_format structure for structured output.
+function buildJsonSchemaResponseFormat(schema, name) {
+  return { type: "json_schema", json_schema: { name: name || "response", strict: false, schema } };
+}
+
+// ---------- Groq provider: model routing (pure, testable) ----------
+// Groq doesn't have one model that does everything — capabilities are
+// split across models, confirmed against Groq's own docs, not guessed:
+//   - openai/gpt-oss-20b: confirmed structured-output (json_schema) support
+//     in Groq's own docs example — used for ordinary JSON extraction calls.
+//   - qwen/qwen3.6-27b: confirmed vision + JSON mode, but only the looser
+//     json_object mode is confirmed for it, NOT strict json_schema — so
+//     vision calls get json_object, not a schema, even when the caller
+//     asked for one. The frontend's hardened extractJSON is the safety
+//     net for the resulting less-constrained output.
+//   - groq/compound: Groq's agentic system with built-in, auto-activating
+//     web search — used only for the one call that needs live market
+//     research. Not combined with response_format (unconfirmed whether
+//     compound supports structured output alongside automatic tool use).
+function chooseGroqModel({ hasImage, useWebSearch, hasSchema }) {
+  if (useWebSearch) return { model: "groq/compound", responseFormatMode: "none" };
+  if (hasImage) return { model: "qwen/qwen3.6-27b", responseFormatMode: hasSchema ? "json_object" : "none" };
+  return { model: "openai/gpt-oss-20b", responseFormatMode: hasSchema ? "json_schema" : "none" };
+}
+
 module.exports = {
   normalizeToken, tokenSet, jaccard, specTokens, setsEqual, toNumber,
   SCHEMA_SYNONYMS, mapColumn, findMappingCollisions,
@@ -690,4 +865,5 @@ module.exports = {
   buildImportPlan, effectiveUnitPrice, rankQuotations, purchaseHistoryStats,
   parseRating, looksLikePlaceholderVendor, detectTableBlocks, runDataQualityAudit, benchmarkPrice,
   computeCurrentStock, validateIssueQuantity, computeProcurementStage, auditQuotationLine, extractJSON,
+  classifySheetTable, classifyExtractedLines, toOpenAIContent, buildJsonSchemaResponseFormat, chooseGroqModel,
 };

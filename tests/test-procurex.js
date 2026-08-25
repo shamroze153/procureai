@@ -536,6 +536,142 @@ test("extractJSON: newlines BETWEEN JSON tokens (normal pretty-printing, not ins
   assert.strictEqual(result.b, "two");
 });
 
+/* ============================================================
+   15. Procurement Auditor — document classification.
+   Uses the REAL sheet structures from the user's actual uploaded
+   file (AC_demand_UPDATED.xlsx, inspected directly) — not
+   synthetic data. This is the regression test for the exact
+   reported bug: "extension board — Qty 1, fan — Qty 1" must
+   NEVER be presented as quotation lines from this file.
+   ============================================================ */
+test("classifySheetTable: 'Sheet2' from the real file (title row + bare Item/Qty/Date, no header labels at all) classifies as Internal Demand/Request via the value-based fallback, NEVER as a quotation", () => {
+  // row 1 in the real file is a title caption ("Items provided by workplace
+  // team"), not column headers — headers[] here reflects what SheetJS
+  // would actually hand back as keys for a headerless sheet read this way
+  const headers = ["Items provided by workplace team", "__EMPTY", "__EMPTY_1"];
+  const rows = [
+    { "Items provided by workplace team": "extension board", "__EMPTY": 1, "__EMPTY_1": "2026-11-06" },
+    { "Items provided by workplace team": "fan", "__EMPTY": 1, "__EMPTY_1": "2026-12-06" },
+  ];
+  const result = L.classifySheetTable(headers, rows);
+  assert.strictEqual(result.classification, "Internal Demand/Request");
+  assert.notStrictEqual(result.classification, "Vendor Quotation");
+  assert.ok(result.confidence >= 60);
+});
+
+test("classifySheetTable: the real 'AC Demand' sheet (Name/Qty/Unit Price/Amount/Brand, real tax+total math, but NO vendor column) is Internal Demand/Request, NOT Vendor Quotation — pricing without a vendor identity isn't a quotation", () => {
+  const headers = ["Name", "Qty", "Unit Price", "Amount", "Brand"];
+  const rows = [
+    { Name: "Capacitor 35 µF", Qty: 4, "Unit Price": 700, Amount: 2800, Brand: "Any" },
+    { Name: "Capacitor 40 µF", Qty: 4, "Unit Price": 750, Amount: 3000, Brand: "Any" },
+    { Name: "Fridge Pin Valve", Qty: 4, "Unit Price": 130, Amount: 520, Brand: "Any" },
+  ];
+  const result = L.classifySheetTable(headers, rows);
+  assert.strictEqual(result.classification, "Internal Demand/Request");
+  assert.notStrictEqual(result.classification, "Vendor Quotation");
+  assert.ok(result.reason.includes("no vendor"));
+});
+
+test("classifySheetTable: the real 'Electrical demand' sheet (Product/Recommended Brand/Current Daraz Price — reference prices, no qty requested, no vendor) classifies as Price List, not a quotation", () => {
+  const headers = ["Product Name from List", "Recommended / Authentic Brand", "Current Daraz Price (PKR)"];
+  const rows = [
+    { "Product Name from List": "GMSA Extra Super Glue Elfy", "Recommended / Authentic Brand": "GMSA (Authentic)", "Current Daraz Price (PKR)": "₨ 165" },
+    { "Product Name from List": "Breaker 10Amp / 20Amp (Hamel)", "Recommended / Authentic Brand": "Hamel / Chint", "Current Daraz Price (PKR)": "₨ 790" },
+  ];
+  const result = L.classifySheetTable(headers, rows);
+  assert.strictEqual(result.classification, "Price List");
+});
+
+test("classifySheetTable: the real 'Sheet5' asset register (ID/Tag/Room/Location/Campus/Floor/Brand/Capacity/Status/Year/Health/Category/AssignedTech) classifies as Store/Inventory, not a quotation or demand", () => {
+  const headers = ["ID", "Tag", "Room", "Location", "Campus", "Floor", "Brand", "Capacity", "Status", "Year", "Health", "Category", "AssignedTech"];
+  const rows = [{ ID: 1, Tag: "1-01-08-004-001-0073", Room: "Reception area", Location: "Reception", Campus: "141-C", Floor: "Ground", Brand: "Haier", Capacity: 1, Status: "Active", Year: 2023, Health: 1, Category: "AC" }];
+  const result = L.classifySheetTable(headers, rows);
+  assert.strictEqual(result.classification, "Store/Inventory");
+});
+
+test("classifySheetTable: a genuine vendor quotation (vendor + unit price + tax + quote number) IS correctly recognized — the classifier isn't just conservative in one direction", () => {
+  const headers = ["Item", "Vendor", "Unit Price", "Tax", "Total", "Quotation No"];
+  const rows = [{ Item: "MCB 32A", Vendor: "Al-Karam Electricals", "Unit Price": 4650, Tax: 17, Total: 5440.5, "Quotation No": "QT-1029" }];
+  const result = L.classifySheetTable(headers, rows);
+  assert.strictEqual(result.classification, "Vendor Quotation");
+  assert.ok(result.confidence >= 80);
+});
+
+test("classifyExtractedLines: AI-extracted lines from a PDF/image with no vendor and no price on any line -> Internal Demand/Request, not a quotation", () => {
+  const lines = [{ product: "extension board", qty: 1, vendor: "", unitPrice: null }, { product: "fan", qty: 1, vendor: "", unitPrice: null }];
+  const result = L.classifyExtractedLines(lines);
+  assert.strictEqual(result.classification, "Internal Demand/Request");
+});
+
+test("classifyExtractedLines: AI-extracted lines WITH vendor and price on most lines -> Vendor Quotation", () => {
+  const lines = [{ product: "MCB 32A", qty: 20, vendor: "ABC Electrical", unitPrice: 4650 }, { product: "MCB 16A", qty: 10, vendor: "ABC Electrical", unitPrice: 3200 }];
+  const result = L.classifyExtractedLines(lines);
+  assert.strictEqual(result.classification, "Vendor Quotation");
+});
+
+/* ============================================================
+   16. xAI Grok provider adapter — pure request-building helpers
+   ============================================================ */
+test("toOpenAIContent: plain string passes through unchanged", () => {
+  assert.strictEqual(L.toOpenAIContent("hello world"), "hello world");
+});
+test("toOpenAIContent: text block converts to OpenAI text content shape", () => {
+  const result = L.toOpenAIContent([{ type: "text", text: "hi" }]);
+  assert.deepStrictEqual(result, [{ type: "text", text: "hi" }]);
+});
+test("toOpenAIContent: image block converts to a data-URI image_url block (the documented xAI/OpenAI pattern)", () => {
+  const result = L.toOpenAIContent([{ type: "image", source: { media_type: "image/jpeg", data: "ZmFrZQ==" } }]);
+  assert.strictEqual(result[0].type, "image_url");
+  assert.strictEqual(result[0].image_url.url, "data:image/jpeg;base64,ZmFrZQ==");
+});
+test("toOpenAIContent: document (PDF) block becomes a visible placeholder, NOT silently dropped or pretended to work — PDF input isn't confirmed-supported by xAI's public API", () => {
+  const result = L.toOpenAIContent([{ type: "document", source: { media_type: "application/pdf", data: "ZmFrZQ==" } }]);
+  assert.strictEqual(result[0].type, "text");
+  assert.ok(result[0].text.includes("not confirmed-supported"));
+});
+test("buildJsonSchemaResponseFormat: wraps a schema in the OpenAI/xAI response_format shape", () => {
+  const schema = { type: "object", properties: { ok: { type: "boolean" } } };
+  const wrapped = L.buildJsonSchemaResponseFormat(schema, "TestSchema");
+  assert.strictEqual(wrapped.type, "json_schema");
+  assert.strictEqual(wrapped.json_schema.name, "TestSchema");
+  assert.deepStrictEqual(wrapped.json_schema.schema, schema);
+});
+test("buildJsonSchemaResponseFormat: defaults to a generic name when none is given", () => {
+  const wrapped = L.buildJsonSchemaResponseFormat({ type: "object" });
+  assert.strictEqual(wrapped.json_schema.name, "response");
+});
+
+/* ============================================================
+   17. Groq provider — model routing. Groq's capabilities are split
+   across models (confirmed against Groq's own docs), so the request
+   shape must route to the right one — never assume one model does
+   everything.
+   ============================================================ */
+test("chooseGroqModel: a web-search request routes to groq/compound and does NOT request structured output (unconfirmed combo)", () => {
+  const r = L.chooseGroqModel({ hasImage: false, useWebSearch: true, hasSchema: true });
+  assert.strictEqual(r.model, "groq/compound");
+  assert.strictEqual(r.responseFormatMode, "none");
+});
+test("chooseGroqModel: an image request with a schema routes to the vision model using the CONFIRMED json_object mode, not the unconfirmed strict json_schema mode", () => {
+  const r = L.chooseGroqModel({ hasImage: true, useWebSearch: false, hasSchema: true });
+  assert.strictEqual(r.model, "qwen/qwen3.6-27b");
+  assert.strictEqual(r.responseFormatMode, "json_object");
+});
+test("chooseGroqModel: an image request with no schema needed still uses the vision model, but requests no JSON mode at all", () => {
+  const r = L.chooseGroqModel({ hasImage: true, useWebSearch: false, hasSchema: false });
+  assert.strictEqual(r.model, "qwen/qwen3.6-27b");
+  assert.strictEqual(r.responseFormatMode, "none");
+});
+test("chooseGroqModel: a plain text request with a schema routes to the confirmed structured-output model using strict json_schema mode", () => {
+  const r = L.chooseGroqModel({ hasImage: false, useWebSearch: false, hasSchema: true });
+  assert.strictEqual(r.model, "openai/gpt-oss-20b");
+  assert.strictEqual(r.responseFormatMode, "json_schema");
+});
+test("chooseGroqModel: web search takes priority over image (a hypothetical combined request) since compound's image support isn't confirmed", () => {
+  const r = L.chooseGroqModel({ hasImage: true, useWebSearch: true, hasSchema: false });
+  assert.strictEqual(r.model, "groq/compound");
+});
+
 
 console.log("\n=== ProcureX AI — automated test results ===\n");
 results.forEach(([status, name, err]) => {
