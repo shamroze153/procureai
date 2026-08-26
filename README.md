@@ -10,60 +10,57 @@ background agents are explicitly **Phase 2** and are not built here.
 
 ---
 
-## AI provider: Groq
+## AI provider: Gemini
 
-The app's AI backend is **Groq** (console.groq.com), reached only through a
-server-side Vercel function (`api/groq.js`) — the frontend never sees or sends
-your API key. Groq's capabilities are split across models (there's no single
-Groq model that does vision + structured JSON + web search all at once), so
-`api/groq.js` picks the right model per request automatically:
+The app's AI backend is **Google Gemini** (ai.google.dev), reached only through a
+server-side Vercel function (`api/gemini.js`) — the frontend never sees or sends
+your API key.
 
-| Request needs | Model used | Why |
-|---|---|---|
-| Live web search (Market Research) | `groq/compound` | Groq's agentic system with built-in, auto-activating web search |
-| Image input (Procure by Photo, Technician Scan) | `qwen/qwen3.6-27b` | Confirmed vision support in Groq's docs; JSON requests to this model use the looser `json_object` mode, not strict schema (see note below) |
-| Everything else needing structured JSON | `openai/gpt-oss-20b` | Confirmed strict `json_schema` structured-output support in Groq's own docs |
+- **Model**: `gemini-2.5-flash-lite` by default — the cheapest current Gemini
+  model that's still genuinely multimodal (text/image/PDF) and supports Google
+  Search grounding, with the most generous free-tier rate limits in Google's
+  current lineup. Override with the `GEMINI_MODEL` env var if Google deprecates
+  it — no code change needed.
+- **Structured JSON output**: used for every AI call except one (see below) —
+  native `responseSchema` constrained decoding, not fragile text parsing.
+- **Web search**: Google Search grounding, used for Market Research.
 
-**Known gaps, found while researching (not silently assumed to work):**
-- **PDF/document input is not confirmed-supported** by Groq's API — only image
-  input is documented. A PDF sent to the AI becomes a visible placeholder text
-  block instead of pretending extraction happened. If you rely on Procurement
-  Auditor's PDF upload path, test it specifically — it may not work until Groq
-  documents PDF support.
-- **Strict JSON-schema structured output on the vision model is unconfirmed** —
-  only the looser `json_object` mode is documented for `qwen/qwen3.6-27b`. Image
-  requests get less-constrained JSON than text-only requests; the frontend's
-  `extractJSON` parser (with truncation/control-character repair already built
-  in) is the safety net.
-- **Exact free-tier rate limits per model** aren't enumerated anywhere I could
-  access — check your actual limits at console.groq.com rather than assuming a
-  number.
+**One known caveat, found while researching (not silently assumed):**
+combining native structured output (`responseSchema`) with Google Search
+grounding is only confirmed for the Gemini 3.x family in Google's docs — not
+`gemini-2.5-flash-lite`. So Market Research (the one call that needs grounding)
+relies on prompt-based JSON instead of a schema, backed by the frontend's
+hardened `extractJSON` parser, which repairs the two real failure modes already
+found in production use: responses truncated mid-JSON (raised the token budget)
+and literal unescaped control characters inside a JSON string value (auto-repaired).
 
-## Getting a Groq API key
+## Getting a Gemini API key
 
-1. Go to [console.groq.com](https://console.groq.com) → sign up / log in
-2. **API Keys** in the sidebar → **Create API Key**
-3. Copy it — you won't be able to see it again after leaving the page
+1. Go to [ai.google.dev](https://ai.google.dev) → "Get API key"
+2. Sign in with a Google account (phone verification unlocks ~$5 free trial
+   credit; the ongoing free tier itself needs no card)
+3. Create a key and copy it
 
-## Environment variable
+## Environment variables
 
 ```
-GROQ_API_KEY=
+GEMINI_API_KEY=
 ```
 
-That's the only required one. See `.env.example`.
+That's the only required one. See `.env.example` (includes an optional
+`GEMINI_MODEL` override).
 
 ## Local development
 
 ```bash
 npm install
 cp .env.example .env.local
-# edit .env.local and paste your real Groq API key
+# edit .env.local and paste your real Gemini API key
 npm run dev
 ```
 
 `npm run dev` (plain Vite) serves the frontend but does **not** run
-`/api/groq` (that's a Vercel convention). To exercise AI features locally,
+`/api/gemini` (that's a Vercel convention). To exercise AI features locally,
 use the Vercel CLI instead, which runs both together:
 
 ```bash
@@ -79,8 +76,8 @@ npm test
 
 Runs `tests/test-procurex.js` against `tests/procurex-logic.js` — the same
 calculation logic (stock derivation, duplicate detection, price benchmarking,
-quotation auditing, document classification, and the Groq model-routing logic)
-that's inlined into `src/App.jsx`. **86/86 tests pass** as of this release.
+quotation auditing, document classification, and the Gemini schema-conversion
+logic) that's inlined into `src/App.jsx`. **96/96 tests pass** as of this release.
 
 ## Production build
 
@@ -97,9 +94,9 @@ npm run preview    # serve the production build locally to sanity-check it
    and every `.env*` file, so no secrets get committed.
 2. **Import the repo in Vercel** ([vercel.com/new](https://vercel.com/new)) —
    Vercel auto-detects Vite; leave the default build command/output directory.
-   `api/groq.js` is auto-detected as a Serverless Function, no extra config.
+   `api/gemini.js` is auto-detected as a Serverless Function, no extra config.
 3. **Set the environment variable** — Project → Settings → Environment
-   Variables → add `GROQ_API_KEY` = your real key (Production + Preview).
+   Variables → add `GEMINI_API_KEY` = your real key (Production + Preview).
 4. **Deploy** — Vercel runs `npm install && npm run build` in its own
    environment.
 5. **Redeploy after any env var change** — adding or changing an environment
@@ -115,9 +112,10 @@ npm run preview    # serve the production build locally to sanity-check it
 3. **Procurement Auditor** — upload a real Excel/CSV quotation.
 4. **Procure by Photo** — upload a real product photo.
 
-If any of these fail, the app shows the real error text from Groq (rate limit,
-invalid key, model error, etc.) instead of a generic failure — read it, it
-usually tells you exactly what's wrong.
+If any of these fail, the app shows the real error text from Gemini (rate
+limit, invalid key, model error, etc.) instead of a generic failure — read it,
+it usually tells you exactly what's wrong. A `429`/quota message is Google's
+free-tier rate limit, not a bug — wait a bit or enable billing for higher limits.
 
 ---
 
@@ -127,32 +125,34 @@ This project was built and edited inside a sandboxed environment **with no
 network access** — its `npm install` is blocked by the npm registry (confirmed,
 not assumed). Because of that:
 
-- **`npm test` was actually run, here, for real: 86/86 passing.** Zero
+- **`npm test` was actually run, here, for real: 96/96 passing.** Zero
   dependencies beyond Node itself, so it was runnable in this sandbox.
 - **`npm install` and `npm run build` were NOT run here** — this sandbox
   cannot reach the npm registry. Every `.jsx`/`.js` file's syntax was validated
-  instead (0 errors), and every Node-executed config file passes `node --check`.
-- **No live Groq API request has been made from this code** — I don't have a
-  Groq key and this sandbox has no network access to test one anyway. Every
-  endpoint, auth header, request/response shape, and model choice was verified
-  against Groq's own documentation (console.groq.com) before being written —
-  not guessed — but the actual live request/response cycle is genuinely
-  **UNTESTED** until you run the Settings connection test after deploying.
+  instead (0 errors).
+- **This exact Gemini setup was previously live-tested** earlier in this
+  project's development (real 429 quota responses and a real malformed-JSON
+  response were both observed and fixed against actual Gemini API traffic) —
+  but the schema-conversion logic (`toGeminiSchema`) is new since then, added
+  to match how the frontend's schemas changed during an interim provider
+  experiment. That specific conversion is unit-tested (see `test-procurex.js`)
+  but not yet exercised against a live Gemini request — verify with the
+  Settings connection test after deploying.
 
 ## Project structure
 
 ```
 disrupt-procure-ai/
 ├── api/
-│   └── groq.js             # Vercel serverless function — the ONLY place Groq's API is spoken; holds the key server-side
+│   └── gemini.js            # Vercel serverless function — the ONLY place Gemini's API is spoken; holds the key server-side
 ├── src/
-│   ├── App.jsx              # the entire application (single component tree)
-│   ├── main.jsx              # React mount point
-│   ├── storage.js            # localStorage-backed persistence (per-browser, no backend DB)
-│   └── index.css             # Tailwind entry
+│   ├── App.jsx               # the entire application (single component tree)
+│   ├── main.jsx               # React mount point
+│   ├── storage.js             # localStorage-backed persistence (per-browser, no backend DB)
+│   └── index.css              # Tailwind entry
 ├── tests/
-│   ├── procurex-logic.js     # pure calculation + provider-adapter logic, mirrored inline in App.jsx
-│   └── test-procurex.js      # 86 tests
+│   ├── procurex-logic.js      # pure calculation + provider-adapter logic, mirrored inline in App.jsx
+│   └── test-procurex.js       # 96 tests
 ├── index.html
 ├── package.json
 ├── vite.config.js

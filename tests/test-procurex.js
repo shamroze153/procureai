@@ -629,12 +629,13 @@ test("toOpenAIContent: document (PDF) block becomes a visible placeholder, NOT s
   assert.strictEqual(result[0].type, "text");
   assert.ok(result[0].text.includes("not confirmed-supported"));
 });
-test("buildJsonSchemaResponseFormat: wraps a schema in the OpenAI/xAI response_format shape", () => {
+test("buildJsonSchemaResponseFormat: wraps a schema in the OpenAI/Groq response_format shape, normalized for strict mode", () => {
   const schema = { type: "object", properties: { ok: { type: "boolean" } } };
   const wrapped = L.buildJsonSchemaResponseFormat(schema, "TestSchema");
   assert.strictEqual(wrapped.type, "json_schema");
   assert.strictEqual(wrapped.json_schema.name, "TestSchema");
-  assert.deepStrictEqual(wrapped.json_schema.schema, schema);
+  assert.strictEqual(wrapped.json_schema.schema.properties.ok.type, "boolean", "the actual field definitions are preserved");
+  assert.strictEqual(wrapped.json_schema.schema.additionalProperties, false, "normalized for Groq/OpenAI strict mode");
 });
 test("buildJsonSchemaResponseFormat: defaults to a generic name when none is given", () => {
   const wrapped = L.buildJsonSchemaResponseFormat({ type: "object" });
@@ -647,9 +648,9 @@ test("buildJsonSchemaResponseFormat: defaults to a generic name when none is giv
    shape must route to the right one — never assume one model does
    everything.
    ============================================================ */
-test("chooseGroqModel: a web-search request routes to groq/compound and does NOT request structured output (unconfirmed combo)", () => {
+test("chooseGroqModel: a web-search request routes to openai/gpt-oss-20b (the model Browser Search is confirmed on) and does NOT request structured output (unconfirmed combo with forced tool use)", () => {
   const r = L.chooseGroqModel({ hasImage: false, useWebSearch: true, hasSchema: true });
-  assert.strictEqual(r.model, "groq/compound");
+  assert.strictEqual(r.model, "openai/gpt-oss-20b");
   assert.strictEqual(r.responseFormatMode, "none");
 });
 test("chooseGroqModel: an image request with a schema routes to the vision model using the CONFIRMED json_object mode, not the unconfirmed strict json_schema mode", () => {
@@ -669,7 +670,104 @@ test("chooseGroqModel: a plain text request with a schema routes to the confirme
 });
 test("chooseGroqModel: web search takes priority over image (a hypothetical combined request) since compound's image support isn't confirmed", () => {
   const r = L.chooseGroqModel({ hasImage: true, useWebSearch: true, hasSchema: false });
-  assert.strictEqual(r.model, "groq/compound");
+  assert.strictEqual(r.model, "openai/gpt-oss-20b");
+});
+
+/* ============================================================
+   18. ensureStrictObjectSchema — the real fix for the reported bug:
+   "invalid JSON schema for response_format ... /properties/lines/items:
+   `additionalProperties:false` must be set on every object"
+   ============================================================ */
+test("ensureStrictObjectSchema: adds additionalProperties:false to a simple root object", () => {
+  const result = L.ensureStrictObjectSchema({ type: "object", properties: { a: { type: "string" } } });
+  assert.strictEqual(result.additionalProperties, false);
+});
+test("ensureStrictObjectSchema: reproduces and fixes the EXACT reported bug — a nested array-of-objects (like our real 'lines' schema) gets additionalProperties:false on the nested item objects too, not just the root", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      vendor: { type: ["string", "null"] },
+      lines: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { product: { type: "string" }, qty: { type: ["number", "null"] } },
+        },
+      },
+    },
+  };
+  const result = L.ensureStrictObjectSchema(schema);
+  assert.strictEqual(result.additionalProperties, false, "root object must have additionalProperties:false");
+  assert.strictEqual(result.properties.lines.items.additionalProperties, false, "the nested 'lines' item objects — the exact thing Groq's error complained about — must also have it");
+});
+test("ensureStrictObjectSchema: strict mode requires every property key to be in 'required' — auto-fills this so optional/nullable fields aren't accidentally omitted", () => {
+  const schema = { type: "object", properties: { a: { type: "string" }, b: { type: ["number", "null"] } } };
+  const result = L.ensureStrictObjectSchema(schema);
+  assert.deepStrictEqual(result.required.sort(), ["a", "b"]);
+});
+test("ensureStrictObjectSchema: does not mutate the original schema object (pure function)", () => {
+  const schema = { type: "object", properties: { a: { type: "string" } } };
+  L.ensureStrictObjectSchema(schema);
+  assert.strictEqual(schema.additionalProperties, undefined);
+});
+test("buildJsonSchemaResponseFormat: now uses strict:true and applies ensureStrictObjectSchema automatically, so callers never have to remember additionalProperties per-schema", () => {
+  const schema = { type: "object", properties: { lines: { type: "array", items: { type: "object", properties: { x: { type: "string" } } } } } };
+  const wrapped = L.buildJsonSchemaResponseFormat(schema, "Test");
+  assert.strictEqual(wrapped.json_schema.strict, true);
+  assert.strictEqual(wrapped.json_schema.schema.properties.lines.items.additionalProperties, false);
+});
+
+/* ============================================================
+   19. toGeminiSchema — converts the app's neutral JSON Schema
+   (lowercase types, ["type","null"] unions) into Gemini's own
+   format (uppercase Type, separate "nullable" boolean). This is
+   what actually lets Gemini work again after the schemas were
+   changed to the neutral format during the Groq migration.
+   ============================================================ */
+test("toGeminiSchema: converts basic lowercase types to Gemini's uppercase Type strings", () => {
+  const result = L.toGeminiSchema({ type: "object", properties: { a: { type: "string" }, b: { type: "integer" }, c: { type: "boolean" } } });
+  assert.strictEqual(result.type, "OBJECT");
+  assert.strictEqual(result.properties.a.type, "STRING");
+  assert.strictEqual(result.properties.b.type, "INTEGER");
+  assert.strictEqual(result.properties.c.type, "BOOLEAN");
+});
+test("toGeminiSchema: converts a [\"string\",\"null\"] union (the app's way of marking an optional field) into Gemini's {type:\"STRING\", nullable:true}", () => {
+  const result = L.toGeminiSchema({ type: "object", properties: { catalogMatch: { type: ["string", "null"] } } });
+  assert.strictEqual(result.properties.catalogMatch.type, "STRING");
+  assert.strictEqual(result.properties.catalogMatch.nullable, true);
+});
+test("toGeminiSchema: reproduces the app's real quotation-extraction schema shape (nested array of objects with several nullable fields) end to end", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      vendor: { type: ["string", "null"] },
+      lines: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { product: { type: "string" }, qty: { type: ["number", "null"] } },
+        },
+      },
+    },
+  };
+  const result = L.toGeminiSchema(schema);
+  assert.strictEqual(result.type, "OBJECT");
+  assert.strictEqual(result.properties.vendor.type, "STRING");
+  assert.strictEqual(result.properties.vendor.nullable, true);
+  assert.strictEqual(result.properties.lines.type, "ARRAY");
+  assert.strictEqual(result.properties.lines.items.type, "OBJECT");
+  assert.strictEqual(result.properties.lines.items.properties.qty.type, "NUMBER");
+  assert.strictEqual(result.properties.lines.items.properties.qty.nullable, true);
+});
+test("toGeminiSchema: drops additionalProperties — a Groq/OpenAI strict-mode requirement Gemini doesn't use", () => {
+  const result = L.toGeminiSchema({ type: "object", additionalProperties: false, properties: { a: { type: "string" } } });
+  assert.strictEqual(result.additionalProperties, undefined);
+});
+test("toGeminiSchema: does not mutate the original schema object", () => {
+  const schema = { type: "object", properties: { a: { type: ["string", "null"] } } };
+  L.toGeminiSchema(schema);
+  assert.strictEqual(schema.type, "object", "original untouched");
+  assert.deepStrictEqual(schema.properties.a.type, ["string", "null"], "original untouched");
 });
 
 

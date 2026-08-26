@@ -13,9 +13,9 @@ if (typeof window !== "undefined" && !window.storage) window.storage = localStor
 /* ============================================================
    DISRUPT PROCURE AI — AI Procurement + Store Intelligence Platform
    Working MVP. Every calculation below runs on real data you
-   feed it. AI calls hit the real Groq API (web search enabled via
-   groq/compound for market research) via a server-side proxy
-   (/api/groq) so no API key is ever exposed to the browser.
+   feed it. AI calls hit the real Gemini API (web search enabled via
+   Google Search grounding for market research) via a server-side
+   proxy (/api/gemini) so no API key is ever exposed to the browser.
    Nothing here fakes a result — if there isn't enough evidence,
    the UI says so instead of inventing one.
    ============================================================ */
@@ -518,7 +518,7 @@ function nowISO() { return new Date().toISOString(); }
 
 // ---------- Claude API call (real, live) ----------
 // Shared error extraction: never just say "failed (404)" — surface the
-// real reason (from our own /api/groq error body) so the person using
+// real reason (from our own /api/gemini error body) so the person using
 // the app, not just a developer with devtools open, can actually see
 // what went wrong. Never includes the API key (the server never sends it
 // back in any response, error or otherwise).
@@ -533,10 +533,8 @@ async function extractErrorMessage(res, fallbackLabel) {
 
 async function callClaude({ system, prompt, useWebSearch = false, maxTokens = 1500, responseSchema = null }) {
   const body = {
-    // NOTE: no "model" field here — api/groq.js chooses the correct
-    // Groq model server-side based on the request shape (image present?
-    // web search requested? schema requested?) since Groq's capabilities
-    // are split across models. See that file's chooseGroqModel().
+    // NOTE: no "model" field here — api/gemini.js chooses the model
+    // server-side (GEMINI_MODEL env var, default gemini-2.5-flash-lite).
     max_tokens: maxTokens,
     system,
     messages: [{ role: "user", content: prompt }],
@@ -545,14 +543,14 @@ async function callClaude({ system, prompt, useWebSearch = false, maxTokens = 15
     body.tools = [{ type: "web_search_20250305", name: "web_search" }];
   }
   // Native structured output — the backend applies this via responseSchema
-  // response_format on Groq's side (constrained decoding, where confirmed), which
+  // responseMimeType/responseSchema on Gemini's side (constrained decoding, where confirmed), which
   // guarantees schema-conforming JSON instead of relying on the model to
   // follow a "respond with only JSON" instruction in the prompt. Not used
-  // together with useWebSearch — see api/groq.js for why.
+  // together with useWebSearch — see api/gemini.js for why.
   if (responseSchema && !useWebSearch) {
     body.responseSchema = responseSchema;
   }
-  const res = await fetch("/api/groq", {
+  const res = await fetch("/api/gemini", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -634,11 +632,11 @@ function sanitizeJSONControlChars(s) {
 
 // ---------- Structured-output schemas (standard JSON Schema) ----------
 // One schema per JSON shape this app actually asks the AI to return.
-// Used via api/groq.js's response_format (OpenAI-compatible Groq
+// Used via api/gemini.js's responseSchema (converted to Gemini's own
 // structured output) for every call except the one that needs web
-// search (Market Research), which api/groq.js deliberately excludes from
+// search (Market Research), which api/gemini.js deliberately excludes from
 // schema mode to avoid an unconfirmed schema+grounding combo on
-// groq/compound's automatic tool use. See that file for the full explanation.
+// Google Search grounding. See that file for the full explanation.
 const SCHEMA_VISION_IDENTIFY = {
   type: "object",
   properties: {
@@ -2014,11 +2012,11 @@ function fileToBase64(file) {
 }
 
 async function callClaudeVision({ base64, mediaType, catalogNames }) {
-  const res = await fetch("/api/groq", {
+  const res = await fetch("/api/gemini", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      max_tokens: 700, // model chosen server-side by api/groq.js based on request shape
+      max_tokens: 700, // model chosen server-side by api/gemini.js
       system: `You identify procurement items from a photo for a Pakistani facility-management store. You are given the store's current product catalog names for reference — prefer matching to one of these if the photo clearly matches, but you may also identify a brand/model/spec not in the catalog. NEVER invent a part number, brand, or spec you cannot actually see — if the image is unclear or you're not confident, say so and ask for a clearer photo (e.g. of the nameplate). Catalog: ${JSON.stringify(catalogNames).slice(0, 3000)}`,
       messages: [{ role: "user", content: [
         { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
@@ -2037,11 +2035,11 @@ async function callClaudeVision({ base64, mediaType, catalogNames }) {
 // instead of one guess, so the user picks the right one rather than the
 // AI silently committing to a possibly-wrong single answer.
 async function identifyProductCandidates({ base64, mediaType, catalogNames }) {
-  const res = await fetch("/api/groq", {
+  const res = await fetch("/api/gemini", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      max_tokens: 900, // model chosen server-side by api/groq.js based on request shape
+      max_tokens: 900, // model chosen server-side by api/gemini.js
       system: `You identify procurement items from a photo for a Pakistani facility-management store, for a "photograph it to buy it" workflow. You are given the store's current product catalog for reference.
 RULES:
 - Never invent a brand, model, part number, or spec you can't actually see in the photo.
@@ -2071,7 +2069,7 @@ Catalog: ${JSON.stringify(catalogNames).slice(0, 3000)}`,
 // of the app's market research.
 //
 // NOTE: this call uses web search grounding, so it deliberately does NOT
-// request native structured output (see api/groq.js for why) — it's
+// request native structured output (see api/gemini.js for why) — it's
 // hardened instead with a larger token budget (this response includes
 // grounding-derived findings + notes, which is what previously got cut
 // off mid-JSON around ~8800 characters at the old 1800-token ceiling)
@@ -2545,9 +2543,9 @@ async function extractQuotationLines(file) {
 
   if (name.endsWith(".pdf")) {
     const base64 = await fileToBase64(file);
-    const res = await fetch("/api/groq", {
+    const res = await fetch("/api/gemini", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ max_tokens: 3000, system: EXTRACT_SYSTEM, // model chosen server-side by api/groq.js
+      body: JSON.stringify({ max_tokens: 3000, system: EXTRACT_SYSTEM, // model chosen server-side by api/gemini.js
         messages: [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } }, { type: "text", text: "Extract the quotation line items from this PDF." }] }],
         responseSchema: SCHEMA_QUOTATION_EXTRACTION }),
     });
@@ -2571,9 +2569,9 @@ async function extractQuotationLines(file) {
 
   if (file.type.startsWith("image/")) {
     const base64 = await fileToBase64(file);
-    const res = await fetch("/api/groq", {
+    const res = await fetch("/api/gemini", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ max_tokens: 3000, system: EXTRACT_SYSTEM, // model chosen server-side by api/groq.js
+      body: JSON.stringify({ max_tokens: 3000, system: EXTRACT_SYSTEM, // model chosen server-side by api/gemini.js
         messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: file.type, data: base64 } }, { type: "text", text: "Extract the quotation line items from this image/screenshot." }] }],
         responseSchema: SCHEMA_QUOTATION_EXTRACTION }),
     });
@@ -2804,8 +2802,8 @@ const TABS = [
 
 // ============================================================
 // SETTINGS — AI Connection Test
-// One minimal request through the real /api/groq route, showing exactly
-// what a live request returns: provider, the actual model Groq used
+// One minimal request through the real /api/gemini route, showing
+// exactly what a live request returns: provider, the actual model used
 // (chosen server-side), and connection status. Never touches or displays
 // the API key itself.
 // ============================================================
@@ -2817,7 +2815,7 @@ function SettingsPanel() {
     setTesting(true);
     setResult(null);
     try {
-      const res = await fetch("/api/groq", {
+      const res = await fetch("/api/gemini", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ system: "Reply with exactly one word: OK.", messages: [{ role: "user", content: "Connection test." }], max_tokens: 10 }),
@@ -2829,10 +2827,9 @@ function SettingsPanel() {
       }
       const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
       // model isn't in the response body (the adapter deliberately keeps
-      // the response shape provider-neutral) — infer which model handled
-      // a plain text-only request the same way api/groq.js does, purely
-      // for display purposes here.
-      const inferredModel = "openai/gpt-oss-20b";
+      // the response shape provider-neutral) — this just reflects the
+      // default configured in api/gemini.js, purely for display here.
+      const inferredModel = "gemini-2.5-flash-lite";
       setResult({ status: text ? "connected" : "failed", model: inferredModel, detail: text || "Empty response" });
     } catch (e) {
       setResult({ status: "failed", detail: e.message });
@@ -2845,12 +2842,12 @@ function SettingsPanel() {
     <div className="space-y-5">
       <Card className="p-6">
         <h2 className="px-font-display text-lg font-semibold">⚙️ Settings</h2>
-        <p className="text-sm text-[var(--muted)] mt-1 max-w-2xl">AI Connection Test — sends one minimal real request through the server-side Groq proxy. Never displays or exposes the API key.</p>
+        <p className="text-sm text-[var(--muted)] mt-1 max-w-2xl">AI Connection Test — sends one minimal real request through the server-side Gemini proxy. Never displays or exposes the API key.</p>
         <Btn variant="primary" className="mt-4" onClick={runTest} disabled={testing}>{testing ? "Testing…" : "Run connection test"}</Btn>
 
         {result && (
           <div className="mt-4 space-y-1 px-font-mono text-sm">
-            <div>AI Provider: <span className="text-[var(--text)]">Groq</span></div>
+            <div>AI Provider: <span className="text-[var(--text)]">Gemini</span></div>
             <div>Model: <span className="text-[var(--text)]">{result.model || "unknown (request failed before model was used)"}</span></div>
             <div>Connection: <Badge tone={result.status === "connected" ? "healthy" : "critical"}>{result.status === "connected" ? "CONNECTED" : "FAILED"}</Badge></div>
             {result.status === "failed" && <div className="text-[var(--danger)] mt-2">{result.detail}</div>}
@@ -2859,7 +2856,7 @@ function SettingsPanel() {
       </Card>
       <Card className="p-4">
         <div className="text-xs text-[var(--muted)]">
-          If this fails, check: (1) <code>GROQ_API_KEY</code> is set in Vercel → Settings → Environment Variables, (2) you redeployed after adding/changing it (env var changes never apply to existing deployments), (3) the key is valid and has remaining quota at <a href="https://console.groq.com" target="_blank" rel="noreferrer" className="text-[var(--cyan)] underline">console.groq.com</a>.
+          If this fails, check: (1) <code>GEMINI_API_KEY</code> is set in Vercel → Settings → Environment Variables, (2) you redeployed after adding/changing it (env var changes never apply to existing deployments), (3) the key is valid and has remaining quota at <a href="https://ai.google.dev" target="_blank" rel="noreferrer" className="text-[var(--cyan)] underline">ai.google.dev</a>.
         </div>
       </Card>
     </div>

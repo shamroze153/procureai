@@ -835,7 +835,7 @@ function toOpenAIContent(content) {
 // lowercase "object"/"string"/"array"/etc.) into the OpenAI/xAI
 // response_format structure for structured output.
 function buildJsonSchemaResponseFormat(schema, name) {
-  return { type: "json_schema", json_schema: { name: name || "response", strict: false, schema } };
+  return { type: "json_schema", json_schema: { name: name || "response", strict: true, schema: ensureStrictObjectSchema(schema) } };
 }
 
 // ---------- Groq provider: model routing (pure, testable) ----------
@@ -848,14 +848,80 @@ function buildJsonSchemaResponseFormat(schema, name) {
 //     vision calls get json_object, not a schema, even when the caller
 //     asked for one. The frontend's hardened extractJSON is the safety
 //     net for the resulting less-constrained output.
-//   - groq/compound: Groq's agentic system with built-in, auto-activating
-//     web search — used only for the one call that needs live market
-//     research. Not combined with response_format (unconfirmed whether
-//     compound supports structured output alongside automatic tool use).
+//   - groq/compound: superseded (see below) — kept as history of what
+//     was tried and why it didn't work.
 function chooseGroqModel({ hasImage, useWebSearch, hasSchema }) {
-  if (useWebSearch) return { model: "groq/compound", responseFormatMode: "none" };
+  // Web search: uses openai/gpt-oss-20b's Browser Search tool with
+  // tool_choice:"required" (forced, reliable) instead of groq/compound(-mini)'s
+  // automatic tool routing — a real test showed compound can silently skip
+  // searching entirely while still returning a plausible-looking
+  // "insufficient evidence" response with no error at all. Forcing the
+  // tool is the documented, reliable mechanism instead.
+  if (useWebSearch) return { model: "openai/gpt-oss-20b", responseFormatMode: "none" };
   if (hasImage) return { model: "qwen/qwen3.6-27b", responseFormatMode: hasSchema ? "json_object" : "none" };
   return { model: "openai/gpt-oss-20b", responseFormatMode: hasSchema ? "json_schema" : "none" };
+}
+
+// Groq/OpenAI strict json_schema mode requires additionalProperties:false
+// on EVERY object node in the schema (not just the root), and requires
+// every property key to appear in that object's "required" array (a
+// genuinely optional field is expressed via a ["type","null"] union, not
+// by omitting it from "required"). Rather than hand-maintain this on
+// every schema, this walks a schema tree and enforces both rules
+// automatically — the actual bug this fixes: a nested "lines" array's
+// item objects didn't have additionalProperties:false, which Groq
+// rejected outright before even attempting the request.
+function ensureStrictObjectSchema(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(ensureStrictObjectSchema);
+  const clone = { ...schema };
+  const isObjectType = clone.type === "object" || (Array.isArray(clone.type) && clone.type.includes("object"));
+  if (isObjectType) {
+    if (clone.properties) {
+      const newProps = {};
+      for (const [k, v] of Object.entries(clone.properties)) newProps[k] = ensureStrictObjectSchema(v);
+      clone.properties = newProps;
+      clone.required = Object.keys(newProps); // strict mode: every key must be required
+    }
+    if (clone.additionalProperties === undefined) clone.additionalProperties = false;
+  }
+  if (clone.items) clone.items = ensureStrictObjectSchema(clone.items);
+  return clone;
+}
+
+// ---------- Gemini provider: schema conversion (pure, testable) ----------
+// The frontend's schemas are defined once, in standard JSON Schema
+// (lowercase types, ["type","null"] unions for optional fields) — the
+// same neutral format used for Groq/xAI. Gemini's own schema format is
+// different (uppercase Type strings, a separate "nullable" boolean
+// instead of a type union), so this converts one into the other. This
+// is the actual fix needed to bring Gemini back after the frontend's
+// schemas were changed to the neutral format during the Groq migration.
+function toGeminiSchema(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(toGeminiSchema);
+
+  let type = schema.type;
+  let nullable = false;
+  if (Array.isArray(type)) {
+    nullable = type.includes("null");
+    type = type.find((t) => t !== "null");
+  }
+  const out = { ...schema };
+  if (type) out.type = type.toUpperCase();
+  if (nullable) out.nullable = true;
+
+  if (out.properties) {
+    const newProps = {};
+    for (const [k, v] of Object.entries(out.properties)) newProps[k] = toGeminiSchema(v);
+    out.properties = newProps;
+  }
+  if (out.items) out.items = toGeminiSchema(out.items);
+  // Gemini doesn't use additionalProperties or require every key listed —
+  // that was a Groq/OpenAI strict-mode requirement, not general JSON
+  // Schema semantics, so it's dropped rather than carried over.
+  delete out.additionalProperties;
+  return out;
 }
 
 module.exports = {
@@ -865,5 +931,5 @@ module.exports = {
   buildImportPlan, effectiveUnitPrice, rankQuotations, purchaseHistoryStats,
   parseRating, looksLikePlaceholderVendor, detectTableBlocks, runDataQualityAudit, benchmarkPrice,
   computeCurrentStock, validateIssueQuantity, computeProcurementStage, auditQuotationLine, extractJSON,
-  classifySheetTable, classifyExtractedLines, toOpenAIContent, buildJsonSchemaResponseFormat, chooseGroqModel,
+  classifySheetTable, classifyExtractedLines, toOpenAIContent, buildJsonSchemaResponseFormat, chooseGroqModel, ensureStrictObjectSchema, toGeminiSchema,
 };
